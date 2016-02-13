@@ -48,7 +48,8 @@ func (r *Reader) RangeIterator(start, end []byte) store.KVIterator {
 
 // Close terminates the reader transaction.
 func (r *Reader) Close() error {
-	r.store.closeTxnReadonly(r.txn)
+	//r.store.closeTxnReadonly(r.txn)
+	r.txn.Abort()
 	return nil
 }
 

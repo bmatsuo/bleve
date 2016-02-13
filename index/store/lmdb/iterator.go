@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"runtime"
 
 	"github.com/blevesearch/bleve/index/store"
 	"github.com/bmatsuo/lmdb-go/exp/lmdbscan"
@@ -45,16 +46,42 @@ func newIterator(txn *lmdb.Txn, dbi lmdb.DBI) *iterator {
 	it := &iterator{
 		cls:  make(chan struct{}),
 		term: make(chan struct{}),
+		req:  make(chan *req),
 		s:    lmdbscan.New(txn, dbi),
 	}
 	if it.s.Err() != nil {
 		log.Print(it.s.Err())
 	}
+	runtime.SetFinalizer(it, (*iterator).Close)
 	return it
 }
 
 func (it *iterator) start(k []byte) {
+	c := make(chan *item)
+	it.item = c
+	it.io = c
 	go it.loop(k)
+}
+
+func (it *iterator) wait() ([]byte, bool) {
+	for {
+		select {
+		case <-it.cls:
+			close(it.term)
+			return nil, false
+		case req := <-it.req:
+			if req.key != nil {
+				it.item = req.item
+				return req.key, true
+			}
+			select {
+			case <-it.cls:
+				close(it.term)
+				return nil, false
+			case it.item <- &item{}:
+			}
+		}
+	}
 }
 
 func (it *iterator) send(k, v []byte) ([]byte, bool) {
@@ -67,48 +94,76 @@ func (it *iterator) send(k, v []byte) ([]byte, bool) {
 
 	select {
 	case <-it.cls:
+		//log.Printf("closed")
 		close(it.term)
 		return nil, false
 	case req := <-it.req:
 		if req.key != nil {
-			log.Print("SEEK")
+			//log.Print("SEEK")
 			it.item = req.item
 			return req.key, false
 		}
+		//log.Printf("REQUEST")
 	}
 
 	select {
 	case <-it.cls:
-		log.Print("closed")
+		//log.Print("closed")
 		close(it.term)
 		return nil, false
 	case it.item <- i:
-		log.Print("sent")
+		//log.Print("sent")
 		return nil, true
 	}
 }
 
 func (it *iterator) loop(k []byte) {
+	var ok bool
+	//log.Printf("LOOP")
 	defer it.s.Close()
-	defer it.send(nil, nil)
-	it.seek(k)
-	for it.s.Scan() {
-		if it.Cont != nil && !it.Cont(it.s.Key(), it.s.Val()) {
-			log.Printf("stop")
+	closed := false
+	defer func() {
+		if !closed {
+			it.send(nil, nil)
+		}
+		//log.Printf("DONE")
+	}()
+	for {
+		it.seek(k)
+		//log.Printf("SCAN")
+		for it.s.Scan() {
+			//log.Printf("CHECK %q %q", it.s.Key(), it.s.Val())
+			if it.Cont != nil && !it.Cont(it.s.Key(), it.s.Val()) {
+				it.send(nil, nil)
+				k, ok = it.wait()
+				if !ok {
+					closed = true
+					return
+				}
+				it.seek(k)
+				continue
+			}
+			//log.Printf("SEND %q %q", it.s.Key(), it.s.Val())
+			k, ok = it.send(it.s.Key(), it.s.Val())
+			if !ok {
+				if k == nil {
+					closed = true
+					return
+				}
+				it.seek(k)
+			}
+		}
+		if it.s.Err() != nil {
+			log.Print(it.s.Err())
 			return
 		}
-		k, ok := it.send(it.s.Key(), it.s.Val())
+		//log.Printf("WAIT")
+		k, ok = it.wait()
 		if !ok {
-			if k == nil {
-				return
-			}
-			it.seek(k)
+			closed = true
+			return
 		}
 	}
-	if it.s.Err() != nil {
-		log.Print(it.s.Err())
-	}
-	log.Printf("END")
 }
 
 // Seek implements store.KVIterator
@@ -123,22 +178,30 @@ func (it *iterator) Seek(k []byte) {
 		return
 	case it.req <- req:
 		it.io = c
+		it.Next()
 	}
-	it.Next()
 }
 
 func (it *iterator) seek(k []byte) {
-	log.Print("seek")
+	//log.Print("seek")
 	flag := uint(lmdb.SetRange)
 	if len(k) == 0 {
 		flag = lmdb.First
 	}
 	it.s.Set(k, nil, flag)
+	//log.Print("SEEK")
 }
 
 // Next implemnts store.KVIterator
 func (it *iterator) Next() {
-	it.req <- &req{}
+	//log.Printf("NEXT")
+
+	select {
+	case <-it.term:
+		it.curr = nil
+	case it.req <- &req{}:
+		//log.Printf("NEXT REQ")
+	}
 	var ok bool
 	select {
 	case <-it.term:
@@ -148,6 +211,7 @@ func (it *iterator) Next() {
 			panic("concurrent method calls detected")
 		}
 	}
+	//log.Printf("CURRENT %q", it.curr)
 }
 
 // Current implements store.KVIterator
@@ -177,8 +241,10 @@ func (it *iterator) Value() []byte {
 // Valid implements store.KVIterator
 func (it *iterator) Valid() bool {
 	if it.curr == nil {
+		//log.Printf("!VALID")
 		return false
 	}
+	//log.Printf("VALID %v", it.curr.ok)
 	return it.curr.ok
 }
 
@@ -195,11 +261,13 @@ func (it *iterator) Close() (err error) {
 }
 
 func newPrefixIterator(txn *lmdb.Txn, dbi lmdb.DBI, prefix []byte) store.KVIterator {
+	//log.Printf("PREFIX")
 	it := newIterator(txn, dbi)
 	it.Cont = func(k, v []byte) bool {
 		return bytes.HasPrefix(k, prefix)
 	}
 	it.start(prefix)
+	it.Next()
 	return &prefixIterator{
 		iterator: it,
 		prefix:   prefix,
@@ -228,11 +296,13 @@ func (i *prefixIterator) Seek(k []byte) {
 }
 
 func newRangeIterator(txn *lmdb.Txn, dbi lmdb.DBI, start, end []byte) store.KVIterator {
+	//log.Printf("RANGE")
 	it := newIterator(txn, dbi)
 	it.Cont = func(k, v []byte) bool {
 		return end == nil || bytes.Compare(k, end) < 0
 	}
 	it.start(start)
+	it.Next()
 	return &rangeIterator{
 		iterator: it,
 		start:    start,

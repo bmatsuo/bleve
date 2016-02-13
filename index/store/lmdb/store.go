@@ -106,7 +106,7 @@ func (store *Store) Close() error {
 
 // Reader returns a new store.KVReader for the store.
 func (store *Store) Reader() (store.KVReader, error) {
-	txn, err := store.openTxnReadonly()
+	txn, err := store.env.BeginTxn(nil, lmdb.Readonly)
 	if err != nil {
 		return nil, err
 	}
